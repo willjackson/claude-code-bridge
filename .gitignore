@@ -1,0 +1,74 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Package manager locks (keep one, ignore others if you switch)
+# Uncomment the ones you don't use:
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Claude Bridge specific
+.claude-bridge/
+*.bridge-state.json
+
+# Claude Code files
+CLAUDE.md
+instructions.md
+AGENTS.md
+agents/
+scripts/
+
+# Ralph automation
+scripts/ralph/archive/
+scripts/ralph/.last-branch
+
+# Packed packages
+*.tgz
+
+# Optional: addon testing directories
+addons/ddev/.ddev-commands-test/
+addons/docksal/.docksal-test/
