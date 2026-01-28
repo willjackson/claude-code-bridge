@@ -24,6 +24,8 @@ import { createLogger } from '../../utils/logger.js';
 import { loadConfigSync, type BridgeConfig as UtilsBridgeConfig } from '../../utils/config.js';
 import { Bridge, type BridgeConfig, type BridgeMode, type TaskRequest, type FileChunk } from '../../bridge/core.js';
 import { setupGracefulShutdown, handleUnhandledRejections } from '../utils.js';
+import { validateTLSConfig, isTLSEnabled, type TLSConfig } from '../../utils/tls.js';
+import { createAuthConfigFromOptions, validateAuthConfig, type AuthConfig } from '../../utils/auth.js';
 import type { GlobalOptions } from '../index.js';
 
 const logger = createLogger('cli:start');
@@ -39,6 +41,15 @@ export interface StartCommandOptions {
   withHandlers?: boolean;
   launchClaude?: boolean;
   claudeArgs?: string[];
+  // TLS options
+  cert?: string;
+  key?: string;
+  ca?: string;
+  // Auth options
+  authToken?: string;
+  authPassword?: string;
+  authIp?: string[];
+  authRequireAll?: boolean;
 }
 
 /**
@@ -520,6 +531,21 @@ function registerHandlers(
 }
 
 /**
+ * Build TLS configuration from CLI options
+ */
+function buildTLSConfig(options: StartCommandOptions): TLSConfig | undefined {
+  if (!options.cert && !options.key && !options.ca) {
+    return undefined;
+  }
+
+  return {
+    cert: options.cert,
+    key: options.key,
+    ca: options.ca,
+  };
+}
+
+/**
  * Build bridge configuration from CLI options and config file
  */
 function buildBridgeConfig(
@@ -531,6 +557,17 @@ function buildBridgeConfig(
 
   // CLI options override everything
   const cliConfig: Partial<BridgeConfig> = {};
+
+  // Build TLS config from CLI options
+  const cliTlsConfig = buildTLSConfig(options);
+
+  // Build auth config from CLI options
+  const cliAuthConfig = createAuthConfigFromOptions({
+    authToken: options.authToken,
+    authPassword: options.authPassword,
+    authIp: options.authIp,
+    authRequireAll: options.authRequireAll,
+  });
 
   if (options.port) {
     cliConfig.listen = {
@@ -558,6 +595,14 @@ function buildBridgeConfig(
   const hasConnect = cliConfig.connect || fileConfig.connect;
   const mode: BridgeMode = hasConnect ? 'client' : 'host';
 
+  // Merge TLS config: CLI > file config
+  const listenTls = cliTlsConfig ?? fileConfig.listen?.tls;
+  const connectTls = cliTlsConfig ?? fileConfig.connect?.tls;
+
+  // Merge auth config: CLI > file config
+  const listenAuth = cliAuthConfig.type !== 'none' ? cliAuthConfig : fileConfig.listen?.auth;
+  const connectAuth = cliAuthConfig.type !== 'none' ? cliAuthConfig : fileConfig.connect?.auth;
+
   // Build final config with priority: CLI > file config > defaults
   const finalConfig: BridgeConfig = {
     mode: cliConfig.mode ?? fileConfig.mode ?? mode,
@@ -565,6 +610,8 @@ function buildBridgeConfig(
     listen: {
       port: cliConfig.listen?.port ?? fileConfig.listen.port,
       host: cliConfig.listen?.host ?? fileConfig.listen.host,
+      tls: listenTls,
+      auth: listenAuth,
     },
     taskTimeout: fileConfig.interaction.taskTimeout,
     contextSharing: {
@@ -578,6 +625,8 @@ function buildBridgeConfig(
   if (connectUrl) {
     finalConfig.connect = {
       url: connectUrl,
+      tls: connectTls,
+      auth: connectAuth,
     };
   }
 
@@ -617,13 +666,56 @@ async function startBridge(
   // Build configuration
   const config = buildBridgeConfig(options, globalOptions);
 
+  // Validate TLS configuration
+  if (config.listen?.tls && isTLSEnabled(config.listen.tls)) {
+    const tlsValidation = validateTLSConfig(config.listen.tls);
+    if (!tlsValidation.valid) {
+      console.error('TLS configuration errors:');
+      for (const error of tlsValidation.errors) {
+        console.error(`  - ${error}`);
+      }
+      process.exit(1);
+    }
+    for (const warning of tlsValidation.warnings) {
+      console.warn(`  Warning: ${warning}`);
+    }
+  }
+
+  // Validate auth configuration
+  if (config.listen?.auth && config.listen.auth.type !== 'none') {
+    const authValidation = validateAuthConfig(config.listen.auth);
+    if (!authValidation.valid) {
+      console.error('Authentication configuration errors:');
+      for (const error of authValidation.errors) {
+        console.error(`  - ${error}`);
+      }
+      process.exit(1);
+    }
+    for (const warning of authValidation.warnings) {
+      console.warn(`  Warning: ${warning}`);
+    }
+  }
+
   // Log startup info
   console.log('Starting Claude Code Bridge...');
   console.log(`  Instance: ${config.instanceName}`);
   console.log(`  Mode: ${config.mode}`);
 
   if (config.listen) {
-    console.log(`  Listening: ${config.listen.host}:${config.listen.port}`);
+    const protocol = isTLSEnabled(config.listen.tls) ? 'wss' : 'ws';
+    console.log(`  Listening: ${protocol}://${config.listen.host}:${config.listen.port}`);
+
+    if (isTLSEnabled(config.listen.tls)) {
+      console.log('  TLS: enabled');
+    }
+
+    if (config.listen.auth && config.listen.auth.type !== 'none') {
+      const authMethods: string[] = [];
+      if (config.listen.auth.token) authMethods.push('token');
+      if (config.listen.auth.password) authMethods.push('password');
+      if (config.listen.auth.allowedIps?.length) authMethods.push('ip');
+      console.log(`  Auth: ${authMethods.join(', ')}${config.listen.auth.requireAll ? ' (require all)' : ''}`);
+    }
   }
 
   if (config.connect) {
@@ -747,6 +839,13 @@ async function startBridge(
 }
 
 /**
+ * Collect repeated option values into an array
+ */
+function collect(value: string, previous: string[]): string[] {
+  return previous.concat([value]);
+}
+
+/**
  * Create the start command
  */
 export function createStartCommand(): Command {
@@ -756,10 +855,19 @@ export function createStartCommand(): Command {
     .description('Start the bridge server')
     .option('-p, --port <port>', 'Port to listen on (default: 8765)')
     .option('-h, --host <host>', 'Host to bind to (default: 0.0.0.0)')
-    .option('-c, --connect <url>', 'URL to connect to on startup (e.g., ws://localhost:8765)')
+    .option('-c, --connect <url>', 'URL to connect to on startup (e.g., ws://localhost:8765 or wss://...)')
     .option('-d, --daemon', 'Run in background')
     .option('--with-handlers', 'Enable file reading and task handling capabilities')
     .option('--launch-claude', 'Start bridge daemon and launch Claude Code')
+    // TLS options
+    .option('--cert <path>', 'Path to TLS certificate file')
+    .option('--key <path>', 'Path to TLS private key file')
+    .option('--ca <path>', 'Path to CA certificate file')
+    // Auth options
+    .option('--auth-token <token>', 'Require token authentication')
+    .option('--auth-password <password>', 'Require password authentication')
+    .option('--auth-ip <cidr>', 'Allow connections from IP/CIDR (repeatable)', collect, [])
+    .option('--auth-require-all', 'Require ALL auth methods to pass (default: any)')
     .argument('[claude-args...]', 'Arguments to pass to Claude Code (use after --)')
     .action(async (claudeArgs: string[], options: StartCommandOptions) => {
       // Store claude args in options

@@ -15,6 +15,7 @@ import { createLogger } from '../../utils/logger.js';
 import { BridgeMcpServer, type McpServerConfig } from '../../mcp/server.js';
 import { setupGracefulShutdown, handleUnhandledRejections } from '../utils.js';
 import type { GlobalOptions } from '../index.js';
+import type { TLSConfig, AuthConfig } from '../../transport/interface.js';
 
 const logger = createLogger('cli:mcp-server');
 
@@ -24,6 +25,12 @@ const logger = createLogger('cli:mcp-server');
 export interface McpServerCommandOptions {
   connect?: string;
   name?: string;
+  // TLS options
+  ca?: string;
+  noVerifyTls?: boolean;
+  // Auth options
+  authToken?: string;
+  authPassword?: string;
 }
 
 /**
@@ -171,6 +178,28 @@ async function startMcpServer(
     }
   }
 
+  // Build TLS config from options
+  let tlsConfig: TLSConfig | undefined;
+  if (options.ca || options.noVerifyTls) {
+    tlsConfig = {
+      ca: options.ca,
+      rejectUnauthorized: options.noVerifyTls ? false : true,
+    };
+  }
+
+  // Build auth config from options
+  let authConfig: AuthConfig | undefined;
+  if (options.authToken || options.authPassword) {
+    const hasToken = !!options.authToken;
+    const hasPassword = !!options.authPassword;
+
+    authConfig = {
+      type: hasToken && hasPassword ? 'combined' : hasToken ? 'token' : 'password',
+      token: options.authToken,
+      password: options.authPassword,
+    };
+  }
+
   // Build MCP server config
   const config: McpServerConfig = {
     bridgeUrl,
@@ -178,6 +207,8 @@ async function startMcpServer(
     version: '0.4.0',
     instanceName: `mcp-server-${process.pid}`,
     taskTimeout: 60000,
+    tls: tlsConfig,
+    auth: authConfig,
   };
 
   // Create and start MCP server
@@ -222,6 +253,12 @@ export function createMcpServerCommand(): Command {
     .description('Start the MCP server for Claude Code integration')
     .option('-c, --connect <url>', `Bridge WebSocket URL (default: ws://localhost:${DEFAULT_DAEMON_PORT})`)
     .option('--name <name>', 'MCP server name (default: claude-bridge)')
+    // TLS options
+    .option('--ca <path>', 'CA certificate for verifying self-signed certs')
+    .option('--no-verify-tls', 'Skip TLS certificate verification (insecure)')
+    // Auth options
+    .option('--auth-token <token>', 'Token for authentication')
+    .option('--auth-password <password>', 'Password for authentication')
     .action(async (options: McpServerCommandOptions) => {
       // Get global options from parent command
       const globalOptions = command.parent?.opts() as GlobalOptions;

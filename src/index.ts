@@ -141,6 +141,27 @@ export {
   wrapError,
   isErrorCode,
   type ErrorCode,
+  // TLS
+  loadCertificates,
+  loadCertificatesSync,
+  validateTLSConfig,
+  isTLSEnabled,
+  createSecureContextOptions,
+  type TLSConfig,
+  type TLSValidationResult,
+  type LoadedTLSOptions,
+  // Authentication
+  Authenticator,
+  validateToken,
+  validatePassword,
+  validateIp,
+  extractCredentials,
+  createAuthConfigFromOptions,
+  validateAuthConfig,
+  type AuthConfig,
+  type AuthType,
+  type AuthResult,
+  type ExtractedCredentials,
 } from './utils/index.js';
 
 // ============================================================================

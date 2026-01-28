@@ -12,6 +12,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { Bridge, type BridgeConfig } from '../bridge/core.js';
 import { createLogger } from '../utils/logger.js';
+import type { TLSConfig, AuthConfig } from '../transport/interface.js';
 import {
   TOOL_DEFINITIONS,
   createToolHandlers,
@@ -35,6 +36,10 @@ export interface McpServerConfig {
   instanceName?: string;
   /** Task timeout in milliseconds */
   taskTimeout?: number;
+  /** TLS configuration for secure connections */
+  tls?: TLSConfig;
+  /** Authentication configuration */
+  auth?: AuthConfig;
 }
 
 // ============================================================================
@@ -72,6 +77,8 @@ export class BridgeMcpServer {
       instanceName: config.instanceName ?? `mcp-server-${process.pid}`,
       connect: {
         url: config.bridgeUrl,
+        tls: config.tls,
+        auth: config.auth,
       },
       taskTimeout: config.taskTimeout ?? 60000,
     };
