@@ -24,24 +24,55 @@ export enum ConnectionState {
 }
 
 // ============================================================================
+// TLS Configuration
+// ============================================================================
+
+/**
+ * TLS configuration for secure connections
+ */
+export interface TLSConfig {
+  /** Path to certificate PEM file (for server) */
+  cert?: string;
+  /** Path to private key PEM file (for server) */
+  key?: string;
+  /** Path to CA certificate PEM file (for client to verify server, or server to verify client) */
+  ca?: string;
+  /** Whether to reject unauthorized certificates (default: true) */
+  rejectUnauthorized?: boolean;
+  /** Passphrase for encrypted private key */
+  passphrase?: string;
+}
+
+// ============================================================================
 // Connection Configuration
 // ============================================================================
+
+/**
+ * Authentication type
+ */
+export type AuthType = 'none' | 'token' | 'password' | 'ip' | 'combined';
 
 /**
  * Authentication configuration for transport connections
  */
 export interface AuthConfig {
   /** Authentication type */
-  type: 'token' | 'none';
-  /** Authentication token (required if type is 'token') */
+  type: AuthType;
+  /** Authentication token (for type: 'token' or 'combined') */
   token?: string;
+  /** Authentication password (for type: 'password' or 'combined') */
+  password?: string;
+  /** Allowed IP addresses/ranges in CIDR notation (for type: 'ip' or 'combined') */
+  allowedIps?: string[];
+  /** If true, ALL configured methods must pass; if false, ANY passing method is sufficient */
+  requireAll?: boolean;
 }
 
 /**
  * Configuration for establishing a transport connection
  */
 export interface ConnectionConfig {
-  /** Full WebSocket URL (e.g., ws://localhost:8765) */
+  /** Full WebSocket URL (e.g., ws://localhost:8765 or wss://localhost:8765) */
   url?: string;
   /** Host to connect to (used if url is not provided) */
   host?: string;
@@ -55,6 +86,8 @@ export interface ConnectionConfig {
   maxReconnectAttempts?: number;
   /** Authentication configuration */
   auth?: AuthConfig;
+  /** TLS configuration for secure connections */
+  tls?: TLSConfig;
 }
 
 // ============================================================================

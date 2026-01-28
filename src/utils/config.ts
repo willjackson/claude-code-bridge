@@ -4,11 +4,52 @@ import * as os from 'os';
 import { parse as parseYaml } from 'yaml';
 
 /**
+ * TLS configuration for secure connections
+ */
+export interface TLSConfig {
+  /** Path to certificate PEM file */
+  cert?: string;
+  /** Path to private key PEM file */
+  key?: string;
+  /** Path to CA certificate PEM file */
+  ca?: string;
+  /** Whether to reject unauthorized certificates (default: true) */
+  rejectUnauthorized?: boolean;
+  /** Passphrase for encrypted private key */
+  passphrase?: string;
+}
+
+/**
+ * Authentication type
+ */
+export type AuthType = 'none' | 'token' | 'password' | 'ip' | 'combined';
+
+/**
+ * Authentication configuration
+ */
+export interface AuthConfig {
+  /** Authentication type */
+  type: AuthType;
+  /** Authentication token */
+  token?: string;
+  /** Authentication password */
+  password?: string;
+  /** Allowed IP addresses/ranges in CIDR notation */
+  allowedIps?: string[];
+  /** If true, ALL configured methods must pass; if false, ANY passing method is sufficient */
+  requireAll?: boolean;
+}
+
+/**
  * Configuration for the bridge's listening socket
  */
 export interface ListenConfig {
   port: number;
   host: string;
+  /** TLS configuration for secure connections */
+  tls?: TLSConfig;
+  /** Authentication configuration */
+  auth?: AuthConfig;
 }
 
 /**
@@ -18,6 +59,10 @@ export interface ConnectConfig {
   url?: string;
   hostGateway?: boolean;
   port?: number;
+  /** TLS configuration for secure connections */
+  tls?: TLSConfig;
+  /** Authentication configuration */
+  auth?: AuthConfig;
 }
 
 /**

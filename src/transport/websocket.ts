@@ -4,6 +4,7 @@
  */
 
 import WebSocket from 'ws';
+import * as https from 'https';
 import type { BridgeMessage } from '../bridge/protocol.js';
 import { serializeMessage, safeDeserializeMessage } from '../bridge/protocol.js';
 import {
@@ -15,6 +16,7 @@ import {
   type ErrorHandler,
 } from './interface.js';
 import { createLogger } from '../utils/logger.js';
+import { loadCertificatesSync, type LoadedTLSOptions } from '../utils/tls.js';
 
 const logger = createLogger('websocket-transport');
 
@@ -61,15 +63,112 @@ export class WebSocketTransport implements Transport {
 
   /**
    * Build the WebSocket URL from the connection configuration
+   * Uses wss:// if TLS is configured, ws:// otherwise
    */
   private buildUrl(config: ConnectionConfig): string {
     if (config.url) {
+      // If URL provided, use it directly (may already be wss://)
       return config.url;
     }
 
     const host = config.host ?? 'localhost';
     const port = config.port ?? 8765;
-    return `ws://${host}:${port}`;
+
+    // Use wss:// if TLS config has CA cert (client wants to verify server)
+    // or if rejectUnauthorized is explicitly set
+    const useTls = config.tls?.ca || config.tls?.rejectUnauthorized !== undefined;
+    const protocol = useTls ? 'wss' : 'ws';
+
+    return `${protocol}://${host}:${port}`;
+  }
+
+  /**
+   * Build WebSocket options including TLS and auth configuration
+   */
+  private buildWsOptions(config: ConnectionConfig): WebSocket.ClientOptions {
+    const options: WebSocket.ClientOptions = {};
+
+    // Add TLS options if configured
+    if (config.tls) {
+      try {
+        const tlsOptions = loadCertificatesSync(config.tls);
+
+        // Create HTTPS agent with TLS options
+        const agentOptions: https.AgentOptions = {
+          rejectUnauthorized: tlsOptions.rejectUnauthorized ?? true,
+        };
+
+        if (tlsOptions.ca) {
+          agentOptions.ca = tlsOptions.ca;
+        }
+        if (tlsOptions.cert) {
+          agentOptions.cert = tlsOptions.cert;
+        }
+        if (tlsOptions.key) {
+          agentOptions.key = tlsOptions.key;
+        }
+        if (tlsOptions.passphrase) {
+          agentOptions.passphrase = tlsOptions.passphrase;
+        }
+
+        options.agent = new https.Agent(agentOptions);
+
+        // Also set these directly for older ws versions
+        if (tlsOptions.rejectUnauthorized !== undefined) {
+          options.rejectUnauthorized = tlsOptions.rejectUnauthorized;
+        }
+        if (tlsOptions.ca) {
+          options.ca = tlsOptions.ca;
+        }
+
+        logger.debug(
+          { hasCa: !!tlsOptions.ca, rejectUnauthorized: tlsOptions.rejectUnauthorized },
+          'TLS options configured for client'
+        );
+      } catch (error) {
+        logger.error({ error: (error as Error).message }, 'Failed to load TLS certificates');
+        throw error;
+      }
+    }
+
+    // Add auth headers if configured
+    if (config.auth && config.auth.type !== 'none') {
+      options.headers = options.headers || {};
+
+      if (config.auth.token) {
+        options.headers['Authorization'] = `Bearer ${config.auth.token}`;
+      }
+      if (config.auth.password) {
+        options.headers['X-Auth-Password'] = config.auth.password;
+      }
+
+      logger.debug(
+        { hasToken: !!config.auth.token, hasPassword: !!config.auth.password },
+        'Auth headers configured'
+      );
+    }
+
+    return options;
+  }
+
+  /**
+   * Build URL with auth query parameters (fallback for servers that don't support headers)
+   */
+  private buildUrlWithAuth(baseUrl: string, config: ConnectionConfig): string {
+    if (!config.auth || config.auth.type === 'none') {
+      return baseUrl;
+    }
+
+    const url = new URL(baseUrl);
+
+    if (config.auth.token) {
+      url.searchParams.set('token', config.auth.token);
+    }
+    if (config.auth.password) {
+      url.searchParams.set('password', config.auth.password);
+    }
+
+    return url.toString();
   }
 
   /**
@@ -98,12 +197,23 @@ export class WebSocketTransport implements Transport {
 
     this.state = ConnectionState.CONNECTING;
 
-    const url = this.buildUrl(this.config);
-    logger.debug({ url, attempt: this.reconnectAttempts }, 'Connecting to WebSocket server');
+    const baseUrl = this.buildUrl(this.config);
+    const wsOptions = this.buildWsOptions(this.config);
+
+    // Add auth to URL as query params (in addition to headers for compatibility)
+    const url = this.buildUrlWithAuth(baseUrl, this.config);
+
+    logger.debug(
+      { url: baseUrl, attempt: this.reconnectAttempts, hasOptions: Object.keys(wsOptions).length > 0 },
+      'Connecting to WebSocket server'
+    );
 
     return new Promise<void>((resolve, reject) => {
       try {
-        this.ws = new WebSocket(url);
+        // Create WebSocket with options if we have any, otherwise without
+        this.ws = Object.keys(wsOptions).length > 0
+          ? new WebSocket(url, wsOptions)
+          : new WebSocket(url);
 
         // Handle connection open
         this.ws.on('open', () => {

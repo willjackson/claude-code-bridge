@@ -1,6 +1,6 @@
 {
   "name": "@willjackson/claude-code-bridge",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Bidirectional communication system for Claude Code instances across environments",
   "type": "module",
   "main": "dist/index.js",

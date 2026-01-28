@@ -4,13 +4,17 @@
  */
 
 import { WebSocketServer, WebSocket as WsWebSocket } from 'ws';
+import type { IncomingMessage } from 'http';
+import * as https from 'https';
 import { v4 as uuidv4 } from 'uuid';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { createLogger } from '../utils/logger.js';
 import { WebSocketTransport } from '../transport/websocket.js';
-import { ConnectionState, type Transport } from '../transport/interface.js';
+import { ConnectionState, type Transport, type TLSConfig, type AuthConfig } from '../transport/interface.js';
+import { loadCertificatesSync, isTLSEnabled } from '../utils/tls.js';
+import { Authenticator, extractCredentials } from '../utils/auth.js';
 import {
   type BridgeMessage,
   type TaskRequest,
@@ -37,8 +41,9 @@ const logger = createLogger('bridge');
  * Bridge operation mode
  * - 'host': Listen for incoming connections, sends commands via MCP
  * - 'client': Connect to host, receives and executes commands
+ * - 'peer': Bidirectional mode - can both listen and connect
  */
-export type BridgeMode = 'host' | 'client';
+export type BridgeMode = 'host' | 'client' | 'peer';
 
 /**
  * Configuration for the bridge's listening server
@@ -48,18 +53,26 @@ export interface BridgeListenConfig {
   port: number;
   /** Host to bind to (default: 0.0.0.0) */
   host?: string;
+  /** TLS configuration for secure connections */
+  tls?: TLSConfig;
+  /** Authentication configuration */
+  auth?: AuthConfig;
 }
 
 /**
  * Configuration for connecting to a remote bridge
  */
 export interface BridgeConnectConfig {
-  /** Full WebSocket URL (e.g., ws://localhost:8765) */
+  /** Full WebSocket URL (e.g., ws://localhost:8765 or wss://localhost:8765) */
   url?: string;
   /** Use host.docker.internal for container-to-host connection */
   hostGateway?: boolean;
   /** Port to connect to (used if url is not provided) */
   port?: number;
+  /** TLS configuration for secure connections */
+  tls?: TLSConfig;
+  /** Authentication configuration */
+  auth?: AuthConfig;
 }
 
 /**
@@ -185,9 +198,11 @@ interface PendingContextRequest {
 export class Bridge {
   private config: BridgeConfig;
   private server: WebSocketServer | null = null;
+  private httpsServer: https.Server | null = null;
   private clientTransport: WebSocketTransport | null = null;
   private peers: Map<string, PeerConnection> = new Map();
   private started: boolean = false;
+  private authenticator: Authenticator | null = null;
 
   // Event handlers
   private peerConnectedHandlers: PeerConnectedHandler[] = [];
@@ -229,12 +244,17 @@ export class Bridge {
     if (mode === 'client' && !connect) {
       throw new Error("'client' mode requires 'connect' configuration");
     }
+
+    if (mode === 'peer' && !listen && !connect) {
+      throw new Error("'peer' mode requires either 'listen' or 'connect' configuration");
+    }
   }
 
   /**
    * Start the bridge based on configured mode
    * - 'host': Starts WebSocket server, sends commands via MCP
    * - 'client': Connects to host, receives and executes commands
+   * - 'peer': Starts server (if listen configured) and connects to remote (if connect configured)
    */
   async start(): Promise<void> {
     if (this.started) {
@@ -245,13 +265,13 @@ export class Bridge {
     logger.info({ mode }, 'Starting bridge');
 
     try {
-      // Start server if in host mode
-      if (mode === 'host' && this.config.listen) {
+      // Start server if in host mode or peer mode with listen config
+      if ((mode === 'host' || mode === 'peer') && this.config.listen) {
         await this.startServer();
       }
 
-      // Connect to host if in client mode
-      if (mode === 'client' && this.config.connect) {
+      // Connect to remote if in client mode or peer mode with connect config
+      if ((mode === 'client' || mode === 'peer') && this.config.connect) {
         await this.connectToRemote();
       }
 
@@ -647,6 +667,8 @@ export class Bridge {
 
   /**
    * Start the WebSocket server
+   * If TLS is configured, starts an HTTPS server with WebSocket upgrade
+   * If auth is configured, validates connections before accepting
    */
   private async startServer(): Promise<void> {
     const { listen } = this.config;
@@ -654,28 +676,117 @@ export class Bridge {
       throw new Error('Listen configuration is required');
     }
 
+    const host = listen.host ?? '0.0.0.0';
+    const port = listen.port;
+    const useTls = isTLSEnabled(listen.tls);
+
+    // Set up authenticator if auth is configured
+    if (listen.auth && listen.auth.type !== 'none') {
+      this.authenticator = new Authenticator(listen.auth);
+      logger.info({ authType: listen.auth.type }, 'Authentication enabled');
+    }
+
     return new Promise<void>((resolve, reject) => {
-      const host = listen.host ?? '0.0.0.0';
-      const port = listen.port;
+      logger.debug({ host, port, tls: useTls, auth: !!this.authenticator }, 'Starting WebSocket server');
 
-      logger.debug({ host, port }, 'Starting WebSocket server');
+      try {
+        if (useTls && listen.tls) {
+          // Load TLS certificates
+          const tlsOptions = loadCertificatesSync(listen.tls);
+          logger.info({ host, port }, 'Starting secure WebSocket server (wss://)');
 
-      this.server = new WebSocketServer({ host, port });
+          // Create HTTPS server
+          this.httpsServer = https.createServer({
+            cert: tlsOptions.cert,
+            key: tlsOptions.key,
+            ca: tlsOptions.ca,
+            passphrase: tlsOptions.passphrase,
+          });
 
-      this.server.on('listening', () => {
-        logger.info({ host, port }, 'WebSocket server listening');
-        resolve();
-      });
+          // Create WebSocket server attached to HTTPS server
+          const wsOptions: import('ws').ServerOptions = {
+            server: this.httpsServer,
+          };
 
-      this.server.on('error', (error) => {
-        logger.error({ error: (error as Error).message }, 'WebSocket server error');
+          // Add verifyClient for authentication
+          if (this.authenticator) {
+            wsOptions.verifyClient = (info, callback) => {
+              this.verifyClient(info, callback);
+            };
+          }
+
+          this.server = new WebSocketServer(wsOptions);
+
+          // Start HTTPS server
+          this.httpsServer.listen(port, host, () => {
+            logger.info({ host, port, protocol: 'wss' }, 'Secure WebSocket server listening');
+            resolve();
+          });
+
+          this.httpsServer.on('error', (error) => {
+            logger.error({ error: (error as Error).message }, 'HTTPS server error');
+            reject(error);
+          });
+        } else {
+          // Create plain WebSocket server
+          const wsOptions: import('ws').ServerOptions = {
+            host,
+            port,
+          };
+
+          // Add verifyClient for authentication
+          if (this.authenticator) {
+            wsOptions.verifyClient = (info, callback) => {
+              this.verifyClient(info, callback);
+            };
+          }
+
+          this.server = new WebSocketServer(wsOptions);
+
+          this.server.on('listening', () => {
+            logger.info({ host, port, protocol: 'ws' }, 'WebSocket server listening');
+            resolve();
+          });
+
+          this.server.on('error', (error) => {
+            logger.error({ error: (error as Error).message }, 'WebSocket server error');
+            reject(error);
+          });
+        }
+
+        this.server.on('connection', (ws, request) => {
+          this.handleNewConnection(ws, request);
+        });
+      } catch (error) {
+        logger.error({ error: (error as Error).message }, 'Failed to start server');
         reject(error);
-      });
-
-      this.server.on('connection', (ws, request) => {
-        this.handleNewConnection(ws, request);
-      });
+      }
     });
+  }
+
+  /**
+   * Verify client connection for authentication
+   * Used as WebSocketServer verifyClient callback
+   */
+  private verifyClient(
+    info: { origin: string; secure: boolean; req: IncomingMessage },
+    callback: (res: boolean, code?: number, message?: string, headers?: Record<string, string>) => void
+  ): void {
+    if (!this.authenticator) {
+      callback(true);
+      return;
+    }
+
+    const result = this.authenticator.authenticate(info.req);
+
+    if (result.success) {
+      logger.info({ clientIp: result.clientIp, method: result.method }, 'Client authenticated');
+      callback(true);
+    } else {
+      logger.warn({ clientIp: result.clientIp, error: result.error }, 'Client authentication failed');
+      // Use custom close code 4001 for authentication failure
+      callback(false, 4001, result.error || 'Authentication failed');
+    }
   }
 
   /**
@@ -744,7 +855,9 @@ export class Bridge {
     if (!url) {
       const host = connect.hostGateway ? 'host.docker.internal' : 'localhost';
       const port = connect.port ?? 8765;
-      url = `ws://${host}:${port}`;
+      // Use wss:// if TLS is configured
+      const protocol = isTLSEnabled(connect.tls) || connect.tls?.ca ? 'wss' : 'ws';
+      url = `${protocol}://${host}:${port}`;
     }
 
     this.clientTransport = new WebSocketTransport();
@@ -765,6 +878,8 @@ export class Bridge {
         reconnect: true,
         reconnectInterval: 1000,
         maxReconnectAttempts: 10,
+        tls: connect.tls,
+        auth: connect.auth,
       });
 
       // Create peer info for the connected server
@@ -1297,6 +1412,18 @@ export class Bridge {
       });
       this.server = null;
       logger.debug('WebSocket server closed');
+    }
+
+    // Close HTTPS server if it exists
+    if (this.httpsServer) {
+      logger.debug('Closing HTTPS server');
+      await new Promise<void>((resolve) => {
+        this.httpsServer!.close(() => {
+          resolve();
+        });
+      });
+      this.httpsServer = null;
+      logger.debug('HTTPS server closed');
     }
 
     // Remove status file
