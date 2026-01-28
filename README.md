@@ -22,10 +22,10 @@ Claude Code Bridge connects your local Claude Code to remote environments via We
 LOCAL MACHINE                      REMOTE MACHINE
 ┌──────────────────────┐           ┌──────────────────────┐
 │                      │           │                      │
-│    Claude Code       │           │    Bridge Client     │
-│         +            │ WebSocket │   --with-handlers    │
+│    Claude Code       │  ws:// or │    Bridge Client     │
+│         +            │  wss://   │   --with-handlers    │
 │    Bridge Host  ────────────────────►                   │
-│    (port 8766)       │           │  Executes commands   │
+│    (port 8766)       │  (TLS)    │  Executes commands   │
 │                      │           │  on your files       │
 └──────────────────────┘           └──────────────────────┘
 ```
@@ -78,6 +78,46 @@ Replace `HOST_IP` with your local machine's IP address.
 
 That's it! Claude Code now has access to files on the remote machine.
 
+## Secure Connections (TLS + Auth)
+
+For production or untrusted networks, enable TLS encryption and authentication.
+
+### Generate Certificates
+
+```bash
+# Self-signed certificate (for testing)
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
+```
+
+### Start with TLS + Token Auth
+
+**Local machine (host):**
+
+```bash
+claude-bridge start --cert cert.pem --key key.pem --auth-token mysecret123
+```
+
+**Remote machine (client):**
+
+```bash
+claude-bridge start --with-handlers --connect wss://HOST_IP:8765 --ca cert.pem --auth-token mysecret123
+```
+
+### Authentication Options
+
+| Option | Description |
+|--------|-------------|
+| `--auth-token <token>` | Require a shared secret token |
+| `--auth-password <pw>` | Require password authentication |
+| `--auth-ip <cidr>` | Allow only specific IPs (e.g., `192.168.0.0/16`) |
+| `--auth-require-all` | Require ALL auth methods to pass (default: any) |
+
+Combine methods for defense in depth:
+
+```bash
+claude-bridge start --auth-token secret --auth-ip 10.0.0.0/8 --auth-require-all
+```
+
 ## What You Can Do
 
 Once connected, Claude Code gains these MCP tools:
@@ -112,11 +152,23 @@ claude-bridge start [--port 8765] [--launch-claude] [-- claude-args]
 # Client mode (remote machine)
 claude-bridge start --with-handlers --connect ws://HOST:PORT
 
+# Secure connections
+claude-bridge start --cert cert.pem --key key.pem --auth-token secret
+claude-bridge start --with-handlers --connect wss://HOST:PORT --ca cert.pem --auth-token secret
+
 # Utilities
 claude-bridge status    # Check if bridge is running
 claude-bridge stop      # Stop the bridge daemon
 claude-bridge info      # Show system info
 ```
+
+### TLS Options
+
+| Option | Description |
+|--------|-------------|
+| `--cert <path>` | TLS certificate file |
+| `--key <path>` | TLS private key file |
+| `--ca <path>` | CA certificate (for verifying self-signed certs) |
 
 ## Configuration
 
@@ -127,8 +179,26 @@ instanceName: my-bridge
 listen:
   port: 8765
   host: 0.0.0.0
+  tls:
+    cert: /path/to/cert.pem
+    key: /path/to/key.pem
+  auth:
+    type: token  # none, token, password, ip, or combined
+    token: ${BRIDGE_AUTH_TOKEN}  # use environment variable
 interaction:
   taskTimeout: 300000
+```
+
+For client connections:
+
+```yaml
+connect:
+  url: wss://remote-host:8765
+  tls:
+    ca: /path/to/ca.pem
+  auth:
+    type: token
+    token: ${BRIDGE_AUTH_TOKEN}
 ```
 
 ## Troubleshooting
@@ -137,6 +207,16 @@ interaction:
 - Verify the host is running: `claude-bridge status`
 - Check firewall allows port 8765
 - Confirm IP is reachable: `ping HOST_IP`
+
+**TLS connection failing?**
+- Ensure client uses `wss://` (not `ws://`) when connecting to TLS host
+- For self-signed certs, client must use `--ca cert.pem`
+- Check certificate hasn't expired
+
+**Authentication failing?**
+- Verify tokens match exactly on both sides
+- For IP auth, ensure client IP is in allowed CIDR range
+- Check with `-v` flag for detailed auth error messages
 
 **Commands not executing?**
 - Ensure client uses `--with-handlers`
