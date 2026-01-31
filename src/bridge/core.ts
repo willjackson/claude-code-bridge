@@ -1008,28 +1008,34 @@ export class Bridge {
     const task = message.task!;
     logger.debug({ taskId: task.id, peerId }, 'Received task delegation');
 
-    // If no handler registered, try to forward to another peer
+    // If no handler registered, try to forward to other peers
     if (!this.taskReceivedHandler) {
-      // Find another peer to forward to (not the sender)
+      // Find all other peers to forward to (not the sender)
       const otherPeers = Array.from(this.peers.keys()).filter(id => id !== peerId);
 
       if (otherPeers.length > 0) {
-        // Forward to the first available peer
-        const targetPeerId = otherPeers[0];
-        logger.info({ taskId: task.id, targetPeerId }, 'Forwarding task to another peer');
+        // Set up response forwarding - store the original sender
+        const forwardKey = `forward:${task.id}`;
+        (this as unknown as Record<string, string>)[forwardKey] = peerId;
 
-        try {
-          // Forward the original message
-          await this.sendToPeer(targetPeerId, message);
-
-          // Set up response forwarding - store the original sender
-          const forwardKey = `forward:${task.id}`;
-          (this as unknown as Record<string, string>)[forwardKey] = peerId;
-
-          return;
-        } catch (err) {
-          logger.error({ error: (err as Error).message, taskId: task.id }, 'Failed to forward task');
+        // Forward to ALL other peers (broadcast) - the peer with handlers will respond
+        let forwarded = false;
+        for (const targetPeerId of otherPeers) {
+          try {
+            await this.sendToPeer(targetPeerId, message);
+            logger.info({ taskId: task.id, targetPeerId, totalTargets: otherPeers.length }, 'Forwarding task to peer');
+            forwarded = true;
+          } catch (err) {
+            logger.error({ error: (err as Error).message, taskId: task.id, targetPeerId }, 'Failed to forward task to peer');
+          }
         }
+
+        if (forwarded) {
+          return;
+        }
+
+        // Clean up forward key if no peer accepted the message
+        delete (this as unknown as Record<string, string>)[forwardKey];
       }
 
       logger.warn({ taskId: task.id }, 'No task handler registered and no peers to forward to');
@@ -1088,6 +1094,13 @@ export class Bridge {
     const forwardKey = `forward:${taskId}`;
     const originalSender = (this as unknown as Record<string, string>)[forwardKey];
     if (originalSender) {
+      // When broadcasting to multiple peers, ignore "no handler" errors
+      // and wait for the peer that actually has a handler to respond
+      if (!message.result!.success && message.result!.error === 'No task handler registered on peer') {
+        logger.debug({ taskId }, 'Ignoring no-handler response from peer, waiting for handler peer');
+        return;
+      }
+
       delete (this as unknown as Record<string, string>)[forwardKey];
       logger.info({ taskId, originalSender }, 'Forwarding task response to original sender');
       await this.sendToPeer(originalSender, message).catch((err) => {
@@ -1139,28 +1152,34 @@ export class Bridge {
     const query = message.context!.summary!;
     logger.debug({ peerId, messageId: message.id, query }, 'Received context request');
 
-    // If no handler registered, try to forward to another peer
+    // If no handler registered, try to forward to other peers
     if (!this.contextRequestedHandler) {
-      // Find another peer to forward to (not the sender)
+      // Find all other peers to forward to (not the sender)
       const otherPeers = Array.from(this.peers.keys()).filter(id => id !== peerId);
 
       if (otherPeers.length > 0) {
-        // Forward to the first available peer
-        const targetPeerId = otherPeers[0];
-        logger.info({ messageId: message.id, targetPeerId }, 'Forwarding context request to another peer');
+        // Set up response forwarding - store the original sender
+        const forwardKey = `ctxfwd:${message.id}`;
+        (this as unknown as Record<string, string>)[forwardKey] = peerId;
 
-        try {
-          // Forward the original message
-          await this.sendToPeer(targetPeerId, message);
-
-          // Set up response forwarding - store the original sender
-          const forwardKey = `ctxfwd:${message.id}`;
-          (this as unknown as Record<string, string>)[forwardKey] = peerId;
-
-          return;
-        } catch (err) {
-          logger.error({ error: (err as Error).message, messageId: message.id }, 'Failed to forward context request');
+        // Forward to ALL other peers (broadcast)
+        let forwarded = false;
+        for (const targetPeerId of otherPeers) {
+          try {
+            await this.sendToPeer(targetPeerId, message);
+            logger.info({ messageId: message.id, targetPeerId, totalTargets: otherPeers.length }, 'Forwarding context request to peer');
+            forwarded = true;
+          } catch (err) {
+            logger.error({ error: (err as Error).message, messageId: message.id, targetPeerId }, 'Failed to forward context request to peer');
+          }
         }
+
+        if (forwarded) {
+          return;
+        }
+
+        // Clean up forward key if no peer accepted the message
+        delete (this as unknown as Record<string, string>)[forwardKey];
       }
 
       logger.warn({ messageId: message.id }, 'No context request handler registered and no peers to forward to');
@@ -1231,6 +1250,15 @@ export class Bridge {
     const forwardKey = `ctxfwd:${requestId}`;
     const originalSender = (this as unknown as Record<string, string>)[forwardKey];
     if (originalSender) {
+      // When broadcasting to multiple peers, ignore empty responses from
+      // non-handler peers and wait for the real handler to respond with files
+      const files = message.context?.files ?? [];
+      const hasError = !!message.context?.variables?.error;
+      if (files.length === 0 && !hasError) {
+        logger.debug({ requestId }, 'Ignoring empty context response from non-handler peer, waiting for handler peer');
+        return;
+      }
+
       delete (this as unknown as Record<string, string>)[forwardKey];
       logger.info({ requestId, originalSender }, 'Forwarding context response to original sender');
       await this.sendToPeer(originalSender, message).catch((err) => {

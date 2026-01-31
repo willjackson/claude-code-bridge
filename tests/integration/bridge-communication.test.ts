@@ -759,6 +759,286 @@ describe('Bridge Multi-Peer Scenarios', () => {
   });
 });
 
+describe('Bridge Relay Forwarding (MCP pattern)', () => {
+  it('should forward task from client A through host to client B and return response', async () => {
+    // This tests the exact MCP server pattern:
+    // MCP Client (A) → Host (relay, no handler) → Handler Client (B)
+    // Response: B → Host → A
+    const hostPort = 29790;
+
+    const host = new Bridge({
+      mode: 'host',
+      instanceName: 'relay-host',
+      listen: { port: hostPort },
+    });
+    await host.start();
+
+    // Client B connects first (handler client - like the remote machine)
+    const clientB = new Bridge({
+      mode: 'client',
+      instanceName: 'handler-client',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await clientB.start();
+
+    // Register handler on client B
+    clientB.onTaskReceived(async (task) => {
+      return {
+        success: true,
+        data: { processed: true, action: task.data?.action, path: task.data?.path },
+      };
+    });
+
+    // Client A connects second (MCP server - like the local Claude Code)
+    const clientA = new Bridge({
+      mode: 'client',
+      instanceName: 'mcp-client',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await clientA.start();
+
+    await new Promise((r) => setTimeout(r, 300));
+
+    // Verify host has 2 peers
+    expect(host.getPeerCount()).toBe(2);
+
+    // Client A delegates a task (like MCP server would)
+    const result = await clientA.delegateTask({
+      id: 'relay-test-1',
+      description: 'List directory: /',
+      scope: 'execute',
+      data: { action: 'list_directory', path: '/' },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.data.processed).toBe(true);
+    expect(result.data.action).toBe('list_directory');
+    expect(result.data.path).toBe('/');
+
+    await clientA.stop();
+    await clientB.stop();
+    await host.stop();
+  });
+
+  it('should forward context request from client A through host to client B', async () => {
+    const hostPort = 29791;
+
+    const host = new Bridge({
+      mode: 'host',
+      instanceName: 'ctx-relay-host',
+      listen: { port: hostPort },
+    });
+    await host.start();
+
+    const clientB = new Bridge({
+      mode: 'client',
+      instanceName: 'ctx-handler-client',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await clientB.start();
+
+    clientB.onContextRequested(async (query) => {
+      return [{ path: `result/${query}.ts`, content: 'file content' }];
+    });
+
+    const clientA = new Bridge({
+      mode: 'client',
+      instanceName: 'ctx-mcp-client',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await clientA.start();
+
+    await new Promise((r) => setTimeout(r, 300));
+
+    const files = await clientA.requestContext('search-term');
+    expect(files.length).toBe(1);
+    expect(files[0].path).toBe('result/search-term.ts');
+
+    await clientA.stop();
+    await clientB.stop();
+    await host.stop();
+  });
+});
+
+describe('Bridge Relay Forwarding with Multiple Peers', () => {
+  it('should forward task to handler peer even when non-handler peers connect first', async () => {
+    // This simulates the real-world bug: multiple MCP server instances and a remote handler client
+    // The host should broadcast to all peers, and the handler peer should respond
+    const hostPort = 29792;
+
+    const host = new Bridge({
+      mode: 'host',
+      instanceName: 'multi-relay-host',
+      listen: { port: hostPort },
+    });
+    await host.start();
+
+    // Non-handler client connects FIRST (like an orphaned MCP server)
+    const nonHandler1 = new Bridge({
+      mode: 'client',
+      instanceName: 'non-handler-1',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await nonHandler1.start();
+
+    // Another non-handler client connects SECOND
+    const nonHandler2 = new Bridge({
+      mode: 'client',
+      instanceName: 'non-handler-2',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await nonHandler2.start();
+
+    // Handler client connects THIRD (like the remote machine with --with-handlers)
+    const handlerClient = new Bridge({
+      mode: 'client',
+      instanceName: 'handler-client',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await handlerClient.start();
+
+    handlerClient.onTaskReceived(async (task) => {
+      return {
+        success: true,
+        data: { handled: true, action: task.data?.action },
+      };
+    });
+
+    // MCP client connects LAST (the one sending the task)
+    const mcpClient = new Bridge({
+      mode: 'client',
+      instanceName: 'mcp-sender',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await mcpClient.start();
+
+    await new Promise((r) => setTimeout(r, 300));
+    expect(host.getPeerCount()).toBe(4);
+
+    // MCP client sends a task - it should reach the handler client
+    const result = await mcpClient.delegateTask({
+      id: 'multi-peer-test-1',
+      description: 'Read file',
+      scope: 'execute',
+      data: { action: 'read_file', path: 'test.txt' },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.data.handled).toBe(true);
+    expect(result.data.action).toBe('read_file');
+
+    await mcpClient.stop();
+    await handlerClient.stop();
+    await nonHandler2.stop();
+    await nonHandler1.stop();
+    await host.stop();
+  });
+
+  it('should forward context request to handler peer with multiple non-handler peers', async () => {
+    const hostPort = 29793;
+
+    const host = new Bridge({
+      mode: 'host',
+      instanceName: 'multi-ctx-host',
+      listen: { port: hostPort },
+    });
+    await host.start();
+
+    // Non-handler connects first
+    const nonHandler = new Bridge({
+      mode: 'client',
+      instanceName: 'ctx-non-handler',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await nonHandler.start();
+
+    // Handler connects second
+    const handlerClient = new Bridge({
+      mode: 'client',
+      instanceName: 'ctx-handler',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await handlerClient.start();
+
+    handlerClient.onContextRequested(async (query) => {
+      return [{ path: `found/${query}.ts`, content: 'found content' }];
+    });
+
+    // MCP client connects last
+    const mcpClient = new Bridge({
+      mode: 'client',
+      instanceName: 'ctx-mcp-sender',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await mcpClient.start();
+
+    await new Promise((r) => setTimeout(r, 300));
+    expect(host.getPeerCount()).toBe(3);
+
+    const files = await mcpClient.requestContext('my-query');
+    expect(files.length).toBe(1);
+    expect(files[0].path).toBe('found/my-query.ts');
+    expect(files[0].content).toBe('found content');
+
+    await mcpClient.stop();
+    await handlerClient.stop();
+    await nonHandler.stop();
+    await host.stop();
+  });
+
+  it('should return error when no peers have handlers', async () => {
+    const hostPort = 29794;
+
+    const host = new Bridge({
+      mode: 'host',
+      instanceName: 'no-handler-host',
+      listen: { port: hostPort },
+    });
+    await host.start();
+
+    // Only non-handler peers
+    const nonHandler = new Bridge({
+      mode: 'client',
+      instanceName: 'only-non-handler',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await nonHandler.start();
+
+    const mcpClient = new Bridge({
+      mode: 'client',
+      instanceName: 'no-handler-mcp',
+      connect: { url: `ws://localhost:${hostPort}` },
+    });
+    await mcpClient.start();
+
+    await new Promise((r) => setTimeout(r, 300));
+
+    // Task should eventually get an error response (not hang forever)
+    // The non-handler peer sends "No task handler registered on peer" error,
+    // but since we ignore those, this will timeout
+    // Use a short timeout to avoid slow test
+    try {
+      await mcpClient.delegateTask(
+        {
+          id: 'no-handler-test',
+          description: 'Should fail',
+          scope: 'execute',
+          data: { action: 'read_file', path: 'x.txt' },
+          timeout: 3000,
+        },
+      );
+      // Should not reach here
+      expect(true).toBe(false);
+    } catch (err) {
+      expect((err as Error).message).toContain('timed out');
+    }
+
+    await mcpClient.stop();
+    await nonHandler.stop();
+    await host.stop();
+  });
+});
+
 describe('Bridge Auto-Sync Integration', () => {
   it('should automatically sync context at configured intervals', async () => {
     const host = new Bridge({
